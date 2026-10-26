@@ -1,0 +1,28 @@
+{
+  "id": "gitlab",
+  "name": "GitLab",
+  "version": "0.1.0",
+  "publisher": "paul27et",
+  "description": "The merge request and pipeline of the branch you are on, through glab. Hand a failed job or the open review threads to your agent, retry jobs, open everything in GitLab.",
+  "icon": "git-pull-request",
+  "homepage": "https://github.com/paul27et/agentty-gitlab",
+  "links": [{ "label": "Source", "url": "https://github.com/paul27et/agentty-gitlab" }],
+  "main": "main.mjs",
+  "runtime": "node",
+  "apiVersion": 4,
+  "agents": ["claude", "codex"],
+  "permissions": ["workspace.read", "prompt.inject"],
+  "requires": { "name": "glab", "url": "https://gitlab.com/gitlab-org/cli", "note": "The GitLab CLI, signed in with glab auth login." },
+  "detect": ["/opt/homebrew/bin/glab", "/usr/local/bin/glab"],
+  "keywords": ["gitlab", "merge request", "pipeline", "ci", "code review"],
+  "contributes": {
+    "panel": { "title": "GitLab", "icon": "git-pull-request" },
+    "commands": [
+      { "id": "gitlab.openMr", "title": "GitLab: Open this branch's merge request", "icon": "git-pull-request" },
+      { "id": "gitlab.openPipeline", "title": "GitLab: Open this branch's pipeline", "icon": "workflow" },
+      { "id": "gitlab.fixFailedJob", "title": "GitLab: Fix the failed job with an agent", "icon": "bot" },
+      { "id": "gitlab.addressThreads", "title": "GitLab: Address review threads with an agent", "icon": "message-square" },
+      { "id": "gitlab.retryPipeline", "title": "GitLab: Retry failed jobs", "icon": "rotate-cw" }
+    ]
+  }
+}

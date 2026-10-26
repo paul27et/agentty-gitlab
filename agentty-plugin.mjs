@@ -1,0 +1,498 @@
+// Agentty plugin SDK for Node.js (18+). Single file, no dependencies: copy it next to your plugin.
+// SPDX-License-Identifier: MIT
+//
+//   import { createPlugin, ui } from './agentty-plugin.mjs';
+//   const plugin = createPlugin();
+//   plugin.command('hello.say', async ({ context }) => plugin.notify(`Hello from ${context.pane?.cwd}`));
+//   plugin.onPanelOpen(() => plugin.setPanel(ui.column([ui.text('Hello', 'title')])));
+//   plugin.start();
+//
+// Protocol: JSON-RPC 2.0, one JSON object per line on stdin/stdout. Never write anything else to
+// stdout — use `plugin.log()` (stderr), which shows up in Agentty's plugin log.
+
+import { createInterface } from 'node:readline';
+
+export const SDK_VERSION = '1.3.0';
+export const API_VERSION = 6;
+
+/** Builders for the panel UI tree. Every interactive element needs an `id` unique in the panel. */
+export const ui = {
+  column: (children, { gap = 'medium' } = {}) => ({ type: 'column', gap, children: compact(children) }),
+  row: (children, { gap = 'medium', wrap = false } = {}) => ({ type: 'row', gap, wrap, children: compact(children) }),
+  section: (title, children) => ({ type: 'section', title, children: compact(children) }),
+  /** style: body | title | muted | small | code | error | success */
+  text: (text, style = 'body') => ({ type: 'text', text: String(text ?? ''), style }),
+  /** variant: primary | secondary | ghost | danger */
+  button: (id, label, { icon, variant = 'secondary', disabled = false } = {}) => ({ type: 'button', id, label, icon, variant, disabled }),
+  /** rows > 1: a text area that many lines tall (max 24), where Enter adds a line. */
+  input: (id, { placeholder = '', value = '', rows, mono } = {}) => ({ type: 'input', id, placeholder, value, ...(rows ? { rows } : {}), ...(mono ? { mono } : {}) }),
+  /** items: [{ id, title, subtitle?, detail?, icon?, tone?, actions?: [{ id, label?, icon?, tooltip? }] }] — tone colors the icon */
+  list: (id, items, { empty } = {}) => ({ type: 'list', id, items, empty }),
+  /** options: [{ value, label }] */
+  choice: (id, options, value = '') => ({ type: 'choice', id, options, value }),
+  toggle: (id, label, value = false) => ({ type: 'toggle', id, label, value }),
+  /** tone: neutral | info | success | warning | error */
+  badge: (text, tone = 'neutral') => ({ type: 'badge', text, tone }),
+  spinner: (text = '') => ({ type: 'spinner', text }),
+  divider: () => ({ type: 'divider' }),
+  /** steps: [{ id, title, subtitle?, icon?, state?: off | on | active | done | error, selected?, side? }] */
+  flow: (id, steps) => ({ type: 'flow', id, steps }),
+  /** A card beside the panel; its close button sends `close`. */
+  popover: (id, title, children) => ({ type: 'popover', id, title, children: compact(children) }),
+
+  // API 4 — check `uiFeatures` from `plugin.hostInfo()` before using these on an older Agentty.
+
+  /** A raised box around what belongs together. tone colors the icon and the edge. */
+  card: (children, { title, subtitle, icon, tone = 'neutral' } = {}) => ({ type: 'card', title, subtitle, icon, tone, children: compact(children) }),
+  /** Children in equal columns (1–6), wrapping onto new rows. */
+  grid: (children, { columns = 2, gap = 'medium', widths } = {}) => ({ type: 'grid', columns, gap, ...(widths?.length ? { widths } : {}), children: compact(children) }),
+  /** tabs: [{ id, label, icon?, badge? }]. Send only the picked tab's content as children; picking one sends `change`. */
+  tabs: (id, tabs, value, children) => ({ type: 'tabs', id, tabs, value, children: compact(children) }),
+  /** columns: [{ label, align?: start | center | end, grow? }]; rows: [{ id, cells: [string], tone? }]. A row click sends `select`. */
+  table: (id, columns, rows, { empty, selected } = {}) => ({ type: 'table', id, columns, rows, empty, selected }),
+  /** items: [{ label, value, tone?, mono? }] */
+  keyValue: (items) => ({ type: 'keyValue', items }),
+  /** One number that matters: stat('Passed', '128', { detail: '+4 today', tone: 'success' }) */
+  stat: (label, value, { detail, icon, tone = 'neutral' } = {}) => ({ type: 'stat', label, value: String(value ?? ''), detail, icon, tone }),
+  /** value from 0 to 1. detail replaces the percentage on the right. */
+  progress: (value, { label, detail, tone = 'neutral' } = {}) => ({ type: 'progress', value: Number(value) || 0, label, detail, tone }),
+  /** A tinted note. tone: info (default) | success | warning | error | neutral */
+  callout: (text, { title, icon, tone = 'info' } = {}) => ({ type: 'callout', text: String(text ?? ''), title, icon, tone }),
+  /** A drop-down; picking sends `change` with the option's value. options: [{ value, label }] */
+  select: (id, options, value = '', { placeholder, disabled = false } = {}) => ({ type: 'select', id, options, value, placeholder, disabled }),
+  /** A box to tick; sends `change` with the new boolean. */
+  checkbox: (id, label, value = false, { description, disabled = false } = {}) => ({ type: 'checkbox', id, label, value, description, disabled }),
+  /** Monospaced, colored by language (rust, json, ts, sh, …), with a copy button. */
+  code: (text, { language, title } = {}) => ({ type: 'code', text: String(text ?? ''), language, title }),
+
+  // API 5 — `uiFeatures` has `image` and `graph`.
+
+  /**
+   * A picture from the plugin's own folder (`files/*`): PNG, JPEG, WebP or GIF. With `id`, clicking
+   * sends `click`; with `drop` as well, pictures dragged on from the Finder are copied into `into`
+   * (default `dropped`) and sent as `drop` with `[{ path, name, size }]` (needs `files`).
+   */
+  image: (src, { id, alt, width, height, fit, caption, placeholder, drop = false, into } = {}) =>
+    ({ type: 'image', src: src || undefined, id, alt, width, height, fit, caption, placeholder, drop, into }),
+  /**
+   * Node cards on a canvas joined by wires. nodes: [{ id, title, subtitle?, icon?, tone?, x, y, width?,
+   * inputs?: [{ id, label?, tone? }], outputs?: [...], children?, state?, selected? }]; edges:
+   * [{ from: { node, port }, to: { node, port }, tone?, idle? }]. A heading click sends `select` with
+   * the node as `item`; with `movable`, a dragged heading sends `move` with `{ x, y }` as `value`.
+   * `fill` takes the panel's height instead of `height`; the user scrolls and zooms inside it.
+   */
+  graph: (id, nodes, edges = [], { height, movable = false, fill = false } = {}) =>
+    ({ type: 'graph', id, nodes: nodes.map((n) => ({ ...n, children: compact(n.children) })), edges, height, movable, fill }),
+};
+
+function compact(children) {
+  return (children ?? []).flat().filter(Boolean);
+}
+
+export class AgenttyError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/**
+ * Creates the plugin connection. Register handlers, then call `start()`.
+ * @param {{ input?: NodeJS.ReadableStream, output?: NodeJS.WritableStream }} [streams] for tests
+ */
+export function createPlugin(streams = {}) {
+  const input = streams.input ?? process.stdin;
+  const output = streams.output ?? process.stdout;
+  const commands = new Map();
+  const tools = new Map();
+  const events = new Map();
+  const urls = new Map();
+  const listeners = { activate: [], panelOpen: [], panelClose: [], context: [], event: [], url: [], shutdown: [], browserHidden: [], instanceOpen: [], instanceClose: [] };
+  const pending = new Map();
+  let nextId = 1;
+  let started = false;
+  // Everything but `initialize` waits until the activate handlers have finished.
+  let markActivated;
+  const activated = new Promise((resolve) => (markActivated = resolve));
+
+  const plugin = {
+    /** Filled by `initialize`: { apiVersion, agentty: { version }, plugin: { id, dir, dataDir }, language, context } */
+    info: null,
+    /** Last context Agentty reported (focused workspace and pane). */
+    context: null,
+
+    command(id, handler) {
+      commands.set(id, handler);
+      return plugin;
+    },
+    /**
+     * Answers an AI agent's call of a tool listed in `contributes.tools` (needs the `mcp.tools`
+     * permission): handler({ args, context }) → a string, any JSON value, or MCP content
+     * `{ content: [{ type: 'text', text }], isError? }`. A thrown error goes back to the agent.
+     */
+    tool(name, handler) {
+      tools.set(name, handler);
+      return plugin;
+    },
+    /** Handler for events of one element id: (event, context) => … */
+    onEvent(elementId, handler) {
+      events.set(elementId, handler);
+      return plugin;
+    },
+    /** Handler for every UI event not claimed by `onEvent`. */
+    onAnyEvent(handler) {
+      listeners.event.push(handler);
+      return plugin;
+    },
+    /** `agentty://plugin/<id>/<path>?…` → handler({ path, query, url }) */
+    onUrl(path, handler) {
+      urls.set(path, handler);
+      return plugin;
+    },
+    onAnyUrl(handler) {
+      listeners.url.push(handler);
+      return plugin;
+    },
+    onActivate(handler) {
+      listeners.activate.push(handler);
+      return plugin;
+    },
+    onPanelOpen(handler) {
+      listeners.panelOpen.push(handler);
+      return plugin;
+    },
+    onPanelClose(handler) {
+      listeners.panelClose.push(handler);
+      return plugin;
+    },
+    onContextChange(handler) {
+      listeners.context.push(handler);
+      return plugin;
+    },
+    onShutdown(handler) {
+      listeners.shutdown.push(handler);
+      return plugin;
+    },
+
+    /**
+     * Replaces the panel's content. In a plugin workspace (`mode: "workspace"`) each automation
+     * (tab) has its own panel: pass its `instance`. UI events from it carry that `instance`.
+     */
+    setPanel(tree, { instance } = {}) {
+      return call('ui/setPanel', { tree, instance });
+    },
+    /** The automations (tabs) of the plugin's workspace → [{ instance, title, active }]. */
+    instances() {
+      return call('workspace/instances', {});
+    },
+    /** Names an automation's tab. */
+    setInstanceTitle(instance, title) {
+      return call('workspace/setInstanceTitle', { instance, title });
+    },
+    /** Closes one of the plugin's own automations (its tab), e.g. after the user deleted it. */
+    closeInstance(instance) {
+      return call('workspace/closeInstance', { instance });
+    },
+    /** Another Agentty window with the plugin's workspace in front (right after the user used the plugin). */
+    openWindow() {
+      return call('workspace/openWindow', {});
+    },
+    /** A new automation (tab) in the plugin's workspace, or one that exists when the plugin starts: handler({ instance, title }). */
+    onInstanceOpen(handler) {
+      listeners.instanceOpen.push(handler);
+      return plugin;
+    },
+    /** The user closed an automation's tab: handler({ instance }). Its pages are closed already. */
+    onInstanceClose(handler) {
+      listeners.instanceClose.push(handler);
+      return plugin;
+    },
+    /** Opens (focuses) this plugin's panel. */
+    showPanel() {
+      return call('ui/showPanel', {});
+    },
+    /** kind: info | success | warning | error */
+    notify(message, kind = 'info') {
+      return call('ui/notify', { message: String(message), kind });
+    },
+    /** Small text on the plugin's header button (e.g. a count); '' clears it. */
+    setBadge(text) {
+      return call('ui/setBadge', { text: String(text ?? '') });
+    },
+    getContext() {
+      return call('context/get', {});
+    },
+    /** { version, apiVersion, language, utcOffsetMinutes, uiFeatures } — uiFeatures lists the panel elements this Agentty draws. */
+    hostInfo() {
+      return call('host/info', {});
+    },
+    /**
+     * Sends a prompt to an agent. target: ask (dialog, default) | active | newWorkspace | newTab |
+     * pane (paneId) | workspace (workspaceId). agent: claude | codex | shell. Needs `prompt.inject`.
+     */
+    injectPrompt(request) {
+      return call('prompt/inject', request);
+    },
+    /** Types text into a pane (Enter when `submit`). Needs `terminal.write`. */
+    sendToTerminal({ paneId, text, submit = false }) {
+      return call('terminal/send', { paneId, text, submit });
+    },
+    /**
+     * Terminals opened from now on go through the plugin's proxy at `127.0.0.1:<port>`, with
+     * `pane-<id>:<token>` as its user and password; `port: null` stops it. Needs `terminal.proxy`
+     * (API 6), and ends when the plugin stops.
+     */
+    setTerminalProxy({ port, token } = {}) {
+      return call('terminal/setProxy', { port: port ?? null, token });
+    },
+    /** Conversation of an agent pane: { agent, sessionId, title, cwd, status, turns: [{ role, text }] }. Needs `session.read`. */
+    getSession({ paneId, maxTurns } = {}) {
+      return call('session/get', { paneId, maxTurns });
+    },
+    /** Open workspaces with their panes. Needs `workspace.read`. */
+    listWorkspaces() {
+      return call('workspace/list', {});
+    },
+    openUrl(url) {
+      return call('host/openUrl', { url });
+    },
+    revealPath(path) {
+      return call('host/revealPath', { path });
+    },
+    /**
+     * The in-app browser, signed in as the user, on the sites `browser.sites` names in the
+     * manifest. Needs `browser.control` (apiVersion 3). A plugin never sees a cookie: it hears
+     * whether a site is signed in and asks the user to sign in when it is not.
+     */
+    browser: {
+      /** [{ host, signedIn: true | false | null, expiresAt: ms | null }] in `profile` (default: the browser's own). */
+      sites({ profile } = {}) {
+        return call('browser/sites', { profile });
+      },
+      /**
+       * Opens a page of one of the plugin's sites → { tabId }. mode: auto | background | visible.
+       * profile: a sign-in of its own (made the first time a name is used; macOS 14+).
+       * instance: the automation (a tab of the plugin's workspace) the page belongs to.
+       */
+      open(url, { mode, profile, instance } = {}) {
+        return call('browser/open', { url, mode, profile, instance });
+      },
+      navigate(tabId, url) {
+        return call('browser/navigate', { tabId, url });
+      },
+      /**
+       * Runs `script` (a function, or the body of an async function) in the page with `args`, and
+       * resolves to what it returns (anything JSON can carry).
+       */
+      async eval(tabId, script, args = null, { timeoutMs } = {}) {
+        const body = typeof script === 'function' ? `return (${script.toString()})(args);` : String(script);
+        const { value } = await call('browser/eval', { tabId, script: body, args, timeoutMs });
+        return value;
+      },
+      /** Resolves once the page has finished loading → { url, title }. */
+      wait(tabId, { timeoutMs } = {}) {
+        return call('browser/wait', { tabId, timeoutMs });
+      },
+      /** { tabId, url, title, loading, visible, site } */
+      info(tabId) {
+        return call('browser/info', { tabId });
+      },
+      /** Shows the page as a tab of the browser panel, with a message for the user. */
+      show(tabId, message) {
+        return call('browser/show', { tabId, message });
+      },
+      hide(tabId) {
+        return call('browser/hide', { tabId });
+      },
+      close(tabId) {
+        return call('browser/close', { tabId });
+      },
+      /**
+       * Opens the site's sign-in page for the user and resolves once they are signed in, closed the
+       * tab or ten minutes passed → { signedIn, expiresAt?, reason? }.
+       */
+      signIn(host, { message, profile, instance } = {}) {
+        return call('browser/signIn', { host, message, profile, instance });
+      },
+      /** The profiles the plugin has made → { supported, profiles: [name] }. */
+      profiles() {
+        return call('browser/profiles', {});
+      },
+      /** Deletes a profile with everything signed in there → { removed }. */
+      removeProfile(profile) {
+        return call('browser/removeProfile', { profile });
+      },
+    },
+    /** The user took a plugin page out of the browser panel: handler({ tabId }). It still runs. */
+    onBrowserHidden(handler) {
+      listeners.browserHidden.push(handler);
+      return plugin;
+    },
+
+    /** Writes to Agentty's log for this plugin (stderr). */
+    log(...parts) {
+      process.stderr.write(parts.map((p) => (typeof p === 'string' ? p : safeJson(p))).join(' ') + '\n');
+    },
+
+    /** Starts reading messages from Agentty. */
+    start() {
+      if (started) return plugin;
+      started = true;
+      const lines = createInterface({ input, crlfDelay: Infinity });
+      lines.on('line', (line) => {
+        if (!line.trim()) return;
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          plugin.log('agentty-plugin: ignoring a line that is not JSON');
+          return;
+        }
+        handle(message).catch((err) => plugin.log('agentty-plugin:', err?.stack ?? String(err)));
+      });
+      lines.on('close', () => shutdown(0));
+      process.on('uncaughtException', (err) => plugin.log('uncaught exception:', err?.stack ?? String(err)));
+      process.on('unhandledRejection', (err) => plugin.log('unhandled rejection:', err?.stack ?? String(err)));
+      return plugin;
+    },
+  };
+
+  function send(message) {
+    output.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
+  }
+
+  function call(method, params) {
+    const id = nextId++;
+    send({ id, method, params });
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+    });
+  }
+
+  async function run(listenersList, ...args) {
+    for (const listener of listenersList) {
+      await listener(...args);
+    }
+  }
+
+  async function shutdown(code) {
+    try {
+      await run(listeners.shutdown);
+    } finally {
+      process.exit(code);
+    }
+  }
+
+  async function handle(message) {
+    if (message.method === undefined && message.id !== undefined) {
+      const waiter = pending.get(message.id);
+      if (!waiter) return;
+      pending.delete(message.id);
+      if (message.error) waiter.reject(new AgenttyError(message.error.message, message.error.code));
+      else waiter.resolve(message.result);
+      return;
+    }
+    const params = message.params ?? {};
+    if (message.method === 'initialize') {
+      plugin.info = params;
+      plugin.context = params.context ?? null;
+      send({ id: message.id, result: { sdkVersion: SDK_VERSION, apiVersion: API_VERSION } });
+      try {
+        await guarded(() => run(listeners.activate, params));
+      } finally {
+        markActivated();
+      }
+      return;
+    }
+    await activated;
+    if (params.context !== undefined) plugin.context = params.context;
+    switch (message.method) {
+      case 'command/execute': {
+        const handler = commands.get(params.command);
+        if (!handler) {
+          plugin.log(`no handler for command ${params.command}`);
+          return;
+        }
+        await guarded(() => handler({ context: params.context, args: params.args ?? {} }));
+        return;
+      }
+      case 'tools/call': {
+        const handler = tools.get(params.name);
+        if (message.id === undefined) return;
+        if (!handler) {
+          send({ id: message.id, error: { code: -32601, message: `no handler for tool ${params.name}` } });
+          return;
+        }
+        try {
+          const result = await handler({ args: params.arguments ?? {}, context: params.context });
+          send({ id: message.id, result: result === undefined ? null : result });
+        } catch (err) {
+          plugin.log(err?.stack ?? String(err));
+          send({ id: message.id, error: { code: -32603, message: err?.message ?? String(err) } });
+        }
+        return;
+      }
+      case 'ui/event': {
+        const handler = events.get(params.element);
+        if (handler) await guarded(() => handler(params, params.context));
+        else await guarded(() => run(listeners.event, params, params.context));
+        return;
+      }
+      case 'panel/open':
+        await guarded(() => run(listeners.panelOpen, params.context));
+        return;
+      case 'panel/close':
+        await guarded(() => run(listeners.panelClose, params.context));
+        return;
+      case 'context/changed':
+        await guarded(() => run(listeners.context, params.context));
+        return;
+      case 'url/open': {
+        const handler = urls.get(params.path);
+        if (handler) await guarded(() => handler(params));
+        else await guarded(() => run(listeners.url, params));
+        return;
+      }
+      case 'browser/hidden':
+        await guarded(() => run(listeners.browserHidden, params));
+        return;
+      case 'instance/open':
+        await guarded(() => run(listeners.instanceOpen, params));
+        return;
+      case 'instance/close':
+        await guarded(() => run(listeners.instanceClose, params));
+        return;
+      case 'shutdown':
+        await shutdown(0);
+        return;
+      default:
+        if (message.id !== undefined) {
+          send({ id: message.id, error: { code: -32601, message: `unknown method ${message.method}` } });
+        }
+    }
+  }
+
+  /** Errors in handlers become an error notification instead of killing the plugin. */
+  async function guarded(fn) {
+    try {
+      await fn();
+    } catch (err) {
+      plugin.log(err?.stack ?? String(err));
+      try {
+        await plugin.notify(err?.message ?? String(err), 'error');
+      } catch {
+        // Agentty is gone.
+      }
+    }
+  }
+
+  return plugin;
+}
+
+function safeJson(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}

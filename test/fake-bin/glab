@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+// A stand-in for glab in tests: answers `glab api` from FAKE_GLAB_FIXTURES and logs each call.
+// Host locked.example.com answers the way glab 1.102 does without a token.
+const fs = require('node:fs');
+
+const args = process.argv.slice(2);
+let method = 'GET';
+let host = '';
+const rest = [];
+for (let i = 1; i < args.length; i++) {
+  if (args[i] === '--hostname') host = args[++i];
+  else if (args[i] === '--method') method = args[++i];
+  else rest.push(args[i]);
+}
+const endpoint = rest[0];
+fs.appendFileSync(process.env.FAKE_GLAB_LOG, `${method} ${endpoint}\n`);
+if (host === 'locked.example.com') {
+  process.stderr.write('\n ERROR \n\n  Unauthenticated.\n\n');
+  process.exit(1);
+}
+const fixtures = JSON.parse(fs.readFileSync(process.env.FAKE_GLAB_FIXTURES, 'utf8'));
+const key = `${method} ${endpoint}`;
+if (!(key in fixtures)) {
+  process.stderr.write('glab: 404 Not Found (HTTP 404)\n');
+  process.exit(1);
+}
+const body = fixtures[key];
+process.stdout.write(typeof body === 'string' ? body : JSON.stringify(body));

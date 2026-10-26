@@ -1,0 +1,9 @@
+{
+  "name": "agentty-gitlab",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GitLab merge requests and pipelines in Agentty, through glab.",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test test/" }
+}
