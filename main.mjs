@@ -34,7 +34,7 @@ const state = {
   loading: false,
   busy: null, // the action in flight: 'job:<id>', 'pipeline', 'fix' or 'threads'
   ...branchData(),
-  mine: { host: null, review: [], authored: [], loaded: false, loading: false, error: null },
+  mine: { host: null, review: [], authored: [], loaded: false, loading: false, error: null, showHidden: false },
 };
 
 let panelOpen = false;
@@ -174,14 +174,14 @@ function updateBadge() {
   quietly(plugin.setBadge(text));
 }
 
-function hostFile() {
+function dataFile(name) {
   const dir = plugin.info?.plugin?.dataDir ?? process.env.AGENTTY_PLUGIN_DATA;
-  return dir ? join(dir, 'last-host.json') : null;
+  return dir ? join(dir, name) : null;
 }
 
 async function loadHost() {
   try {
-    const { host } = JSON.parse(await readFile(hostFile(), 'utf8'));
+    const { host } = JSON.parse(await readFile(dataFile('last-host.json'), 'utf8'));
     if (isHost(host)) lastHost = host;
   } catch {
     // first run, or no data folder
@@ -190,7 +190,61 @@ async function loadHost() {
 
 function rememberHost(host) {
   lastHost = host;
-  if (hostFile()) quietly(writeFile(hostFile(), JSON.stringify({ host })));
+  const file = dataFile('last-host.json');
+  if (file) quietly(writeFile(file, JSON.stringify({ host })));
+}
+
+// MRs the user hid from "My MRs" (stale ones that cannot be closed), with what the hidden list shows.
+const hidden = new Map();
+const hiddenKey = (host, id) => `${host} ${id}`;
+const isHidden = (mr) => hidden.has(hiddenKey(state.mine.host, mr.id));
+let saving = Promise.resolve();
+
+async function loadHidden() {
+  try {
+    for (const mr of JSON.parse(await readFile(dataFile('hidden-mrs.json'), 'utf8'))) {
+      if (isHost(mr?.host) && Number.isInteger(mr.id)) hidden.set(hiddenKey(mr.host, mr.id), mr);
+    }
+  } catch {
+    // nothing hidden yet
+  }
+}
+
+function saveHidden() {
+  const file = dataFile('hidden-mrs.json');
+  if (!file) return;
+  // One write at a time, each with the list as it is by then.
+  saving = saving.then(() => writeFile(file, JSON.stringify([...hidden.values()]))).catch((err) => log('could not save the hidden MRs:', err.message));
+}
+
+function hideMr(mr) {
+  const host = state.mine.host;
+  hidden.set(hiddenKey(host, mr.id), { host, id: mr.id, title: mr.title, ref: mr.references?.full ?? `!${mr.iid}`, url: mr.web_url });
+  saveHidden();
+  render();
+}
+
+function unhideMr(key) {
+  hidden.delete(key);
+  if (!hiddenHere().length) state.mine.showHidden = false;
+  saveHidden();
+  render();
+}
+
+const hiddenHere = () => [...hidden.values()].filter((mr) => mr.host === state.mine.host);
+
+/** Forgets hidden MRs that are closed or merged; only lists GitLab did not cut short can tell. */
+function pruneHidden(host, { review, authored }) {
+  if (review.length >= MY_MRS || authored.length >= MY_MRS) return;
+  const open = new Set([...review, ...authored].map((mr) => hiddenKey(host, mr.id)));
+  let changed = false;
+  for (const [key, mr] of hidden) {
+    if (mr.host === host && !open.has(key)) {
+      hidden.delete(key);
+      changed = true;
+    }
+  }
+  if (changed) saveHidden();
 }
 
 async function refreshMine() {
@@ -200,7 +254,9 @@ async function refreshMine() {
   render();
   try {
     if (!host) throw new Error('Focus a terminal in a GitLab repository once, so the plugin knows which GitLab to ask.');
-    Object.assign(mine, await gitlab(host).myMrs(), { loaded: true, error: null });
+    const lists = await gitlab(host).myMrs();
+    Object.assign(mine, lists, { loaded: true, error: null });
+    pruneHidden(host, lists);
   } catch (err) {
     mine.error = err;
   } finally {
@@ -351,7 +407,7 @@ async function ensureFresh() {
 
 function render() {
   if (!panelOpen) return;
-  const reviews = state.mine.review.length;
+  const reviews = state.mine.review.filter((mr) => !isHidden(mr)).length;
   const tabs = [
     { id: 'branch', label: 'This branch', icon: 'git-branch' },
     { id: 'mine', label: 'My MRs', icon: 'git-pull-request', badge: reviews ? String(reviews) : undefined },
@@ -568,11 +624,24 @@ function mineView() {
   if (m.error) return errorView(m.error, m.host);
   if (!m.loaded) return [ui.spinner('Loading your merge requests…')];
   const capped = m.review.length >= MY_MRS || m.authored.length >= MY_MRS;
+  const review = m.review.filter((mr) => !isHidden(mr));
+  const authored = m.authored.filter((mr) => !isHidden(mr));
+  const hiddenMrs = hiddenHere();
   return [
-    ui.section(`Review requested (${m.review.length})`, [ui.list('mine.review', m.review.map((mr) => mrItem(mr, true)), { empty: 'Nobody is waiting for your review.' })]),
-    ui.section(`Yours (${m.authored.length})`, [ui.list('mine.authored', m.authored.map((mr) => mrItem(mr, false)), { empty: 'You have no open merge requests.' })]),
+    ui.section(`Review requested (${review.length})`, [ui.list('mine.review', review.map((mr) => mrItem(mr, true)), { empty: 'Nobody is waiting for your review.' })]),
+    ui.section(`Yours (${authored.length})`, [ui.list('mine.authored', authored.map((mr) => mrItem(mr, false)), { empty: 'You have no open merge requests.' })]),
+    hiddenMrs.length > 0 &&
+      ui.button('mine.showHidden', m.showHidden ? 'Collapse hidden' : `Show ${hiddenMrs.length} hidden`, {
+        icon: m.showHidden ? 'chevron-up' : 'chevron-down',
+        variant: 'ghost',
+      }),
+    m.showHidden && hiddenMrs.length > 0 && ui.section(`Hidden (${hiddenMrs.length})`, [ui.list('mine.hidden', hiddenMrs.map(hiddenItem))]),
     ui.text(`On ${m.host}${capped ? ` · the ${MY_MRS} updated last of each list` : ''}`, 'small'),
   ];
+}
+
+function hiddenItem(mr) {
+  return { id: String(mr.id), title: mr.title, subtitle: mr.ref, icon: 'eye-off', tone: 'neutral', actions: [{ id: 'unhide', icon: 'eye', tooltip: 'Show again' }] };
 }
 
 function mrItem(mr, withAuthor) {
@@ -584,7 +653,10 @@ function mrItem(mr, withAuthor) {
     detail: ago(mr.updated_at),
     icon,
     tone,
-    actions: [{ id: 'copy', icon: 'copy', tooltip: 'Copy link' }],
+    actions: [
+      { id: 'copy', icon: 'copy', tooltip: 'Copy link' },
+      { id: 'hide', icon: 'eye-off', tooltip: 'Hide from this list' },
+    ],
   };
 }
 
@@ -603,7 +675,8 @@ const refreshTab = () => (state.tab === 'mine' ? refreshMine() : update({ loud: 
 const mineEvent = (key) => (event) => {
   const mr = state.mine[key].find((m) => String(m.id) === event.item);
   if (!mr) return;
-  return event.event === 'action' ? copy(mr.web_url) : open(mr.web_url);
+  if (event.event !== 'action') return open(mr.web_url);
+  return event.action === 'hide' ? hideMr(mr) : copy(mr.web_url);
 };
 
 // A branch switch in the focused terminal does not change its folder, so look every few seconds.
@@ -613,7 +686,7 @@ setInterval(() => {
 
 plugin
   .onActivate(async () => {
-    await loadHost();
+    await Promise.all([loadHost(), loadHidden()]);
     // Not awaited: Agentty waits for activation before it sends anything else.
     setTimeout(() => quietly(update()), 0);
   })
@@ -659,6 +732,16 @@ plugin
   .onEvent('threads', (event) => open(state.threads.find((t) => t.id === event.item)?.url))
   .onEvent('mine.review', mineEvent('review'))
   .onEvent('mine.authored', mineEvent('authored'))
+  .onEvent('mine.showHidden', () => {
+    state.mine.showHidden = !state.mine.showHidden;
+    render();
+  })
+  .onEvent('mine.hidden', (event) => {
+    const key = hiddenKey(state.mine.host, event.item);
+    const mr = hidden.get(key);
+    if (!mr) return;
+    return event.event === 'action' ? unhideMr(key) : open(mr.url);
+  })
   .command('gitlab.openMr', async () => {
     if (!(await ensureFresh())) return;
     if (state.mr) return open(state.mr.web_url);

@@ -14,6 +14,8 @@ your focused terminal is on, and hands GitLab work to your agent.
   (downstream triggers and allowed failures included, as GitLab does), and open anything in GitLab.
   Manual jobs (deploys and the like) are listed but never started from the panel.
 - **My MRs**: open MRs waiting for your review and the ones you wrote, on the focused repo's host.
+  Hide the stale ones with the eye button; **Show N hidden** brings them back. The hidden list lives
+  in the plugin's data folder and forgets MRs once they are merged or closed.
 - A badge with the number of failed jobs while the branch's pipeline is red, and a notification
   when a pipeline you are watching finishes.
 

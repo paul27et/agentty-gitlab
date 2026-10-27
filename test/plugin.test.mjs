@@ -61,6 +61,15 @@ writeFileSync(
   }),
 );
 writeFileSync(log, '');
+const hiddenFile = join(tmp, 'hidden-mrs.json');
+// Hidden before: an MR that has since been merged (no longer listed) and one on another GitLab.
+writeFileSync(
+  hiddenFile,
+  JSON.stringify([
+    { host: 'gitlab.example.com', id: 777, title: 'Merged since', ref: 'group/proj!7', url: `${WEB}/-/merge_requests/7` },
+    { host: 'gitlab.other.example', id: 1, title: 'Elsewhere', ref: 'x/y!1', url: 'https://gitlab.other.example/x/y/-/merge_requests/1' },
+  ]),
+);
 
 for (const [dir, remote] of [
   [repo, 'git@gitlab.example.com:group/proj.git'],
@@ -104,6 +113,19 @@ const context = (cwd) => ({ pane: { id: 1, kind: 'claude', status: 'idle', cwd }
 const event = (params) => send({ method: 'ui/event', params: { context: context(repo), ...params } });
 /** The panel redraw that ends an action (the plugin refuses a second action while one runs). */
 const settled = (message) => waitFor((m) => m.method === 'ui/setPanel', { from: received.indexOf(message) + 1 });
+
+/** Retries `check` until it stops throwing: for files the plugin writes after it redraws. */
+async function eventually(check, timeout = 2000) {
+  const end = Date.now() + timeout;
+  for (;;) {
+    try {
+      return check();
+    } catch (err) {
+      if (Date.now() > end) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+}
 
 before(async () => {
   child = spawn(process.execPath, [join(root, 'main.mjs')], {
@@ -226,8 +248,42 @@ test('"My MRs" lists what waits for review', async () => {
   assert.match(tree, /Review me/);
   assert.match(tree, /other\/repo!3 · @bob/);
   assert.match(tree, /You have no open merge requests/);
+  assert.match(tree, /"badge":"1"/);
+  assert.doesNotMatch(tree, /Show \d+ hidden/, 'the merged MR and the other host\'s are not counted here');
   event({ element: 'tabs', event: 'change', value: 'branch' });
   await waitFor(panelWith('Pipeline #100'), { from: received.indexOf(panel) + 1 });
+});
+
+test('a hidden MR leaves "My MRs" and its badge until it is shown again', async () => {
+  const savedIds = () => JSON.parse(readFileSync(hiddenFile, 'utf8')).map((mr) => mr.id);
+  let from = received.length;
+  event({ element: 'tabs', event: 'change', value: 'mine' });
+  await waitFor(panelWith('Review requested (1)'), { from });
+  assert.deepEqual(savedIds(), [1], 'loading the lists forgot the merged MR, not the other host\'s');
+
+  from = received.length;
+  event({ element: 'mine.review', event: 'action', item: '900', action: 'hide' });
+  let tree = JSON.stringify((await waitFor(panelWith('Review requested (0)'), { from })).params.tree);
+  assert.doesNotMatch(tree, /Review me/);
+  assert.doesNotMatch(tree, /"badge"/);
+  assert.match(tree, /Show 1 hidden/);
+  await eventually(() => assert.deepEqual(savedIds(), [1, 900]));
+
+  from = received.length;
+  event({ element: 'mine.showHidden', event: 'click' });
+  tree = JSON.stringify((await waitFor(panelWith('Hidden (1)'), { from })).params.tree);
+  assert.match(tree, /Review me/);
+  assert.doesNotMatch(tree, /Elsewhere/);
+
+  from = received.length;
+  event({ element: 'mine.hidden', event: 'action', item: '900', action: 'unhide' });
+  tree = JSON.stringify((await waitFor(panelWith('Review requested (1)'), { from })).params.tree);
+  assert.doesNotMatch(tree, /Hidden \(|Show \d+ hidden/);
+  await eventually(() => assert.deepEqual(savedIds(), [1]));
+
+  from = received.length;
+  event({ element: 'tabs', event: 'change', value: 'branch' });
+  await waitFor(panelWith('Pipeline #100'), { from });
 });
 
 test('a host glab is not signed in to offers to sign in', async () => {
