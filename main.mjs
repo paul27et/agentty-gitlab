@@ -366,13 +366,17 @@ function render() {
 function header() {
   const repo = state.repo;
   const loading = state.tab === 'mine' ? state.mine.loading : state.loading;
-  return ui.row([
-    ui.column(
-      [ui.text(repo?.path ?? (repo ? basename(repo.root) : 'GitLab'), 'title'), ui.text(repo ? repo.branch || 'detached HEAD' : 'No repository', 'muted')],
-      { gap: 'none' },
-    ),
-    ui.button('refresh', 'Refresh', { icon: 'refresh-cw', variant: 'ghost', disabled: loading }),
-  ]);
+  // A text in a row takes the room its buttons leave; a column there shrinks to one letter.
+  return ui.column(
+    [
+      repo && ui.text(repo.path ?? basename(repo.root), 'title'),
+      ui.row([
+        ui.text(repo ? repo.branch || 'detached HEAD' : 'No repository', 'muted'),
+        ui.button('refresh', 'Refresh', { icon: 'refresh-cw', variant: 'ghost', disabled: loading }),
+      ]),
+    ],
+    { gap: 'none' },
+  );
 }
 
 function errorView(err, host) {
@@ -383,7 +387,7 @@ function errorView(err, host) {
   if (err.kind === 'auth') {
     return [
       ui.callout(`Sign in with glab auth login --hostname ${host}, then try again.`, { title: `Not signed in to ${host}`, tone: 'warning' }),
-      ui.row([ui.button('signin', 'Sign in in a terminal', { icon: 'key-round', variant: 'primary' }), retry], { gap: 'small' }),
+      ui.row([ui.button('signin', 'Sign in in a terminal', { icon: 'key-round', variant: 'primary' }), retry], { gap: 'small', wrap: true }),
     ];
   }
   if (err.status === 404 && state.tab === 'branch') {
